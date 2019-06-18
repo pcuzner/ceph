@@ -8,7 +8,7 @@ except ImportError:
     pass  # just for type checking
 
 try:
-    from kubernetes import client, config
+    from kubernetes import client, config, watch
     from kubernetes.client.rest import ApiException
 
     kubernetes_imported = True
@@ -134,6 +134,129 @@ def deferred_read(f):
     return wrapper
 
 
+def threaded(f):
+    def wrapper(*args, **kwargs):
+        t = threading.Thread(target=f, args=args, kwargs=kwargs)
+        t.daemon = True
+        t.start()
+        return t
+    return wrapper
+
+
+class KubernetesObject(object):
+    """ Generic kubernetes Object parent class
+
+    The api fetch and watch methods should be common across resource types,
+    so this class implements the basics, and child classes should implement 
+    anything specific to the resource type
+    """
+
+    def __init__(self, api_name, method_name, log):
+        self.api_name = api_name
+        self.api = None
+        self.method_name = method_name
+        self.raw_data = None
+        self.log = log
+
+    @property
+    def valid(self):
+        """ Check that the api, and method are viable """
+
+        if not hasattr(client, self.api_name):
+            return False
+        try:
+            _api = getattr(client, self.api_name)()
+        except ApiException:
+            return False
+        else:
+            self.api = _api
+            if not hasattr(_api, self.method_name):
+                return False
+        return True
+
+    def fetch(self):
+        """ Execute the requested api method """
+
+        if self.valid:
+            try:
+                response = getattr(self.api, self.method_name)()
+            except ApiException:
+                self.raw_data = None
+            else:
+                self.raw_data = response
+                self.log.error("[DBG]: {}".format(self.data))
+                self.log.error("[DBG]: res ver - {}".format(self.resource_version))
+
+    @property
+    def data(self):
+        """ Process raw_data into a consumable dict - Override in the child """
+        return self.raw_data
+
+    @property
+    def resource_version(self):
+        # metadata is a V1ListMeta object type
+        if hasattr(self.raw_data, 'metadata'):
+            return self.raw_data.metadata.resource_version
+        else:
+            return None
+
+    @threaded
+    def watch(self):
+        self.fetch()
+        
+        if self.raw_data:
+            res_ver = self.resource_version
+            self.log.info("[INF] Attaching resource watcher for k8s "
+                          "{}/{}".format(self.api_name, self.method_name))
+            w = watch.Watch()
+            func = getattr(self.api, self.method_name)
+
+            try:
+                # execute generator to continually watch resource for changes
+                for item in w.stream(func, resource_version=res_ver, watch=True):
+
+                    if item['type'] == 'ADDED':
+                        self.log.info("[INF] something added")
+
+                    elif item['type'] == 'DELETED':
+                        self.log.info("[INF] something removed")
+
+            except AttributeError as e:
+                self.log.warning("[WRN] Unable to attach watcher - incompatible urllib3?")
+                self.log.warning("[WRN] {}".format(e))
+        else:
+            self.log.error("[ERR] Unable to call k8s API {}".format(self.api_name))
+
+        
+
+class StorageClass(KubernetesObject):
+
+    def __init__(self, api_name='StorageV1Api', method_name='list_storage_class', log=None):
+        KubernetesObject.__init__(self, api_name, method_name, log)
+    
+    @property
+    def data(self):
+        """ provide a more readable/consumable version of the list_storage_class raw data """
+
+        pool_lookup = dict()
+
+        # raw_data contains an items list of V1StorageClass objects. Each object contains metadata
+        # attribute which is a V1ObjectMeta object
+        for item in self.raw_data.items:
+            if not item.provisioner.startswith(('ceph.rook', 'cephfs.csi.ceph', "rbd.csi.ceph")):
+                continue
+            
+            sc_name = item.metadata.name
+            # pool used by ceph csi, blockPool by legacy storageclass definition
+            pool_name = item.parameters.get('pool', item.parameters.get('blockPool'))
+            if pool_name in pool_lookup:
+                    pool_lookup[pool_name].append(sc_name)
+            else:
+                pool_lookup[pool_name] = list([sc_name])
+
+        return pool_lookup
+
+
 class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
     MODULE_OPTIONS = [
         # TODO: configure k8s API addr instead of assuming local
@@ -214,6 +337,7 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
         self._initialized = threading.Event()
         self._k8s = None
         self._rook_cluster = None
+        self.k8s_object = dict()
 
         self._shutdown = threading.Event()
 
@@ -243,6 +367,19 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
         if 'ROOK_CLUSTER_NAME' in os.environ:
             return os.environ['ROOK_CLUSTER_NAME']
 
+    def get_k8s_object(self, object_type, mode='readable'):
+        """ Return specific k8s object data """
+
+        if object_type in self.k8s_object:
+            if mode == 'readable':
+                return self.k8s_object[object_type].data
+            else:
+                return self.k8s_object[object_type].raw_data
+        else:
+            self.log.warning("[WRN] request ignored for non-existent k8s object - {}".format(object_type))
+            return None
+
+
     def serve(self):
         # For deployed clusters, we should always be running inside
         # a Rook cluster.  For development convenience, also support
@@ -262,6 +399,15 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
             configuration.verify_ssl = False
 
         self._k8s = client.CoreV1Api()
+
+        self.k8s_object['storageclass'] = StorageClass(log=self.log)
+        if self.k8s_object['storageclass'].valid:
+            self.log.info("Fetching available storageclass definitions")
+            self.k8s_object['storageclass'].watch()
+        else:
+            self.log.warning("[WRN] Unable to use k8s API - "
+                           "{}/{}".format(self.k8s_object['storageclass'].api_name, 
+                                          self.k8s_object['storageclass'].method_name))
 
         try:
             # XXX mystery hack -- I need to do an API call from
