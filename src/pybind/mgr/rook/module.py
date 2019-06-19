@@ -2,6 +2,9 @@ import threading
 import functools
 import os
 import uuid
+import time
+import json
+
 try:
     from typing import List
 except ImportError:
@@ -151,17 +154,32 @@ class KubernetesObject(object):
     anything specific to the resource type
     """
 
+    fmt_string = "{:<20s}  {:<40s}  {:<15s}  {:<6s}  {:<6s}  {:>4}"
+
     def __init__(self, api_name, method_name, log):
         self.api_name = api_name
         self.api = None
+        self.api_ok = True
         self.method_name = method_name
         self.raw_data = None
+        self.items = dict()
         self.log = log
+        self.watcher = None
+        self.last = None                    # epoch of last invocation of 'fetch'
+        self.resource_type = self.__class__.__name__
+
+    @property
+    def status(self):
+        state = dict()
+        state['fetch'] = self.last
+        state['api_available'] = self.api_ok
+        state['watch'] = self.watcher.is_alive() if self.watcher else False
+        state['items'] = len(self.items)
+        return state
 
     @property
     def valid(self):
         """ Check that the api, and method are viable """
-
         if not hasattr(client, self.api_name):
             return False
         try:
@@ -174,18 +192,36 @@ class KubernetesObject(object):
                 return False
         return True
 
-    def fetch(self):
-        """ Execute the requested api method """
+    def __str__(self):
+        state = self.status
+        out = ''
+        out+="Type: {}\n".format(self.resource_type)
+        out+="Kubernetes API: {}.{}\n".format(self.api_name, self.method_name)
+        out+="Last Full fetch: {}\n".format(time.strftime("%H:%M:%S %Z", time.localtime(state['fetch'])))
+        out+="Watcher Active: {}\n".format(str(state['watch']))
+        out+="Curent Value:\n"
+        out+="{}".format(json.dumps(self.data, indent=4))
+        return out
 
+    def fetch(self):
+        """ Execute the requested api method as a one-off fetch"""
         if self.valid:
             try:
                 response = getattr(self.api, self.method_name)()
             except ApiException:
                 self.raw_data = None
+                self.api_ok = False
             else:
+                self.last = time.time()
                 self.raw_data = response
-                self.log.error("[DBG]: {}".format(self.data))
-                self.log.error("[DBG]: res ver - {}".format(self.resource_version))
+                if hasattr(response, 'items'):
+                    self.items.clear()
+                    for item in response.items:
+                        if self.filter(item):
+                            name = item.metadata.name
+                            self.items[name] = item
+        else:
+            self.api_ok = False
 
     @property
     def data(self):
@@ -200,67 +236,158 @@ class KubernetesObject(object):
         else:
             return None
 
-    @threaded
+    def filter(self, item):
+        """ placeholder function to filter out unwanted items - Override in the child """
+        return True
+
     def watch(self):
+        """ Start a thread which will use the kubernetes watch client against a resource """
         self.fetch()
-        
+        self.log.info("[INF] Attaching resource watcher for k8s "
+                      "{}/{}".format(self.api_name, self.method_name))
+        if self.api_ok:
+            self.watcher = self._watch()
+
+    @threaded
+    def _watch(self):
+        """ worker thread that runs the kubernetes watch """
         if self.raw_data:
             res_ver = self.resource_version
-            self.log.info("[INF] Attaching resource watcher for k8s "
-                          "{}/{}".format(self.api_name, self.method_name))
+
             w = watch.Watch()
             func = getattr(self.api, self.method_name)
 
             try:
                 # execute generator to continually watch resource for changes
                 for item in w.stream(func, resource_version=res_ver, watch=True):
+                    obj = item['object']
+                    try:
+                        name = obj.metadata.name
+                    except AttributeError:
+                        name = None
+                        self.log.warning("[WRN] {}.{} doesn't contain a metadata.name. "
+                                         "Unable to track changes".format(self.api_name,
+                                                                          self.method_name))
 
                     if item['type'] == 'ADDED':
-                        self.log.info("[INF] something added")
+                        if self.filter(obj):
+                            if self.items and name:
+                                self.items[name] = obj
 
                     elif item['type'] == 'DELETED':
-                        self.log.info("[INF] something removed")
+                        if self.filter(obj):
+                            if self.items and name:
+                                del self.items[name]
 
             except AttributeError as e:
                 self.log.warning("[WRN] Unable to attach watcher - incompatible urllib3?")
                 self.log.warning("[WRN] {}".format(e))
+                self.api_ok = False
         else:
+            self.api_ok = False
             self.log.error("[ERR] Unable to call k8s API {}".format(self.api_name))
-
         
 
 class StorageClass(KubernetesObject):
 
     def __init__(self, api_name='StorageV1Api', method_name='list_storage_class', log=None):
         KubernetesObject.__init__(self, api_name, method_name, log)
-    
+
+    def filter(self, item):
+        """ only accept ceph based provisioners """
+        # provisioners: cephfs.csi.ceph.com, rbd.csi.ceph.com, ceph.rook.io/block
+        return True if "ceph" in item.provisioner else False
+
     @property
     def data(self):
         """ provide a more readable/consumable version of the list_storage_class raw data """
-
         pool_lookup = dict()
+        storageclass_metadata = dict()
 
-        # raw_data contains an items list of V1StorageClass objects. Each object contains metadata
-        # attribute which is a V1ObjectMeta object
-        for item in self.raw_data.items:
-            if not item.provisioner.startswith(('ceph.rook', 'cephfs.csi.ceph', "rbd.csi.ceph")):
-                continue
+        sc_data = {
+            "pool_lookup": pool_lookup,
+            "storageclass": storageclass_metadata
+        }
+
+        # items holds V1StorageClass objects indexed by storage class name. Each object contains
+        # metadata which is of type V1ObjectMeta
+        for sc_name in self.items.keys():
+
+            item = self.items[sc_name]
             
-            sc_name = item.metadata.name
             # pool used by ceph csi, blockPool by legacy storageclass definition
             pool_name = item.parameters.get('pool', item.parameters.get('blockPool'))
             if pool_name in pool_lookup:
                     pool_lookup[pool_name].append(sc_name)
             else:
                 pool_lookup[pool_name] = list([sc_name])
+            
+            # storageclass configuration information
+            storageclass_metadata[sc_name] = {
+                "pool": pool_name,
+                "reclaim": item.reclaim_policy
+            }
+            # add specific SC parameters
+            for k in item.parameters:
+                storageclass_metadata[sc_name][k] = item.parameters.get(k)
 
-        return pool_lookup
+        return sc_data
 
 
 class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
     MODULE_OPTIONS = [
         # TODO: configure k8s API addr instead of assuming local
     ]
+    COMMANDS = [
+        {
+            "cmd": "k8sresources",
+            "desc": "Show the status of any kubernetes resources being tracked by mgr/rook",
+            "perm": "r"
+        },
+                {
+            "cmd": "k8sresources detail",
+            "desc": "Show the values of the mgr/rook tracked kubernetes resources",
+            "perm": "r"
+        },
+    ]
+
+    def _k8sresources_summary(self):
+        fmt = KubernetesObject.fmt_string
+        out = fmt.format("Type", "Kubernetes API", "Last Full Fetch","API Ok", "Watch", "Items") + "\n"
+        if self.k8s_object.keys():
+            
+            for v in sorted(self.k8s_object.keys()):
+                obj = self.k8s_object[v]
+                s = obj.status
+                out+=fmt.format(obj.__class__.__name__, 
+                                "{}.{}".format(obj.api_name, obj.method_name),
+                                time.strftime("%H:%M:%S %Z", time.localtime(s['fetch'])),
+                                str(s["api_available"]),
+                                str(s['watch']),
+                                str(s['items'])) + "\n"
+        else:
+            out += "No kubernetes resources monitored"
+        return 0, out, ""
+
+    def _k8sresources_detail(self):
+        out = ""
+        if self.k8s_object.keys():
+            for t in sorted(self.k8s_object.keys()):
+                obj = self.k8s_object[t]
+                out+=str(obj) + "\n"
+        else:
+            out = "No kubernetes resources being monitored"
+        return 0, out, ""
+
+    def handle_command(self, inbuf, cmd):
+
+        if cmd['prefix'] == 'k8sresources detail':
+            return self._k8sresources_detail()
+        elif cmd['prefix'] == 'k8sresources':
+            return self._k8sresources_summary()
+        else:
+            # Shouldn't really get here, but ...
+            raise NotImplementedError(cmd['prefix'])
 
     def _progress(self, *args, **kwargs):
         try:
@@ -402,7 +529,6 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
 
         self.k8s_object['storageclass'] = StorageClass(log=self.log)
         if self.k8s_object['storageclass'].valid:
-            self.log.info("Fetching available storageclass definitions")
             self.k8s_object['storageclass'].watch()
         else:
             self.log.warning("[WRN] Unable to use k8s API - "
