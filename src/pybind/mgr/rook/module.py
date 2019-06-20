@@ -146,21 +146,22 @@ def threaded(f):
     return wrapper
 
 
-class KubernetesObject(object):
-    """ Generic kubernetes Object parent class
+class KubernetesResource(object):
+    """ Generic kubernetes Resource parent class
 
     The api fetch and watch methods should be common across resource types,
     so this class implements the basics, and child classes should implement 
     anything specific to the resource type
     """
 
-    fmt_string = "{:<20s}  {:<40s}  {:<15s}  {:<6s}  {:<6s}  {:>4}"
+    fmt_string = "{:<20s}  {:<40s}  {:^4}  {:<15s}  {:<6s}  {:<6s}  {:>4}"
 
     def __init__(self, api_name, method_name, log):
         self.api_name = api_name
         self.api = None
         self.api_ok = True
         self.method_name = method_name
+        self.health = 'OK'                  # OK or error reason
         self.raw_data = None
         self.items = dict()
         self.log = log
@@ -170,10 +171,14 @@ class KubernetesObject(object):
 
     @property
     def status(self):
+        """ Easily consumable status of the resource tracker object """
         state = dict()
-        state['fetch'] = self.last
-        state['api_available'] = self.api_ok
-        state['watch'] = self.watcher.is_alive() if self.watcher else False
+        tstamp = "N/A" if not self.last else time.strftime("%H:%M:%S %Z", time.localtime(self.last))
+
+        state['fetch'] = tstamp
+        state['health'] = self.health
+        state['api_available'] = str(self.api_ok)
+        state['watch'] = str(self.watcher.is_alive()) if self.watcher else str(False)
         state['items'] = len(self.items)
         return state
 
@@ -181,26 +186,32 @@ class KubernetesObject(object):
     def valid(self):
         """ Check that the api, and method are viable """
         if not hasattr(client, self.api_name):
+            self.health = "[ERR] : API is invalid"
             return False
         try:
             _api = getattr(client, self.api_name)()
         except ApiException:
+            self.health = "[ERR] : API is inaccessible"
             return False
         else:
             self.api = _api
             if not hasattr(_api, self.method_name):
+                self.health = "[ERR] : {} is an anvalid method of {}".format(self.method_name, self.api_name)
                 return False
         return True
 
     def __str__(self):
         state = self.status
+
         out = ''
         out+="Type: {}\n".format(self.resource_type)
         out+="Kubernetes API: {}.{}\n".format(self.api_name, self.method_name)
-        out+="Last Full fetch: {}\n".format(time.strftime("%H:%M:%S %Z", time.localtime(state['fetch'])))
-        out+="Watcher Active: {}\n".format(str(state['watch']))
+        out+="Health: {}\n".format(self.health)
+        out+="Last Full fetch: {}\n".format(state['fetch'])
+        out+="Watcher Active: {}\n".format(state['watch'])
         out+="Curent Value:\n"
         out+="{}".format(json.dumps(self.data, indent=4))
+
         return out
 
     def fetch(self):
@@ -211,6 +222,9 @@ class KubernetesObject(object):
             except ApiException:
                 self.raw_data = None
                 self.api_ok = False
+                self.health = "[ERR] : k8s API call failed against {}.{}".format(self.api_name,
+                                                                                 self.method_name)
+                self.log.error(self.health) 
             else:
                 self.last = time.time()
                 self.raw_data = response
@@ -222,6 +236,10 @@ class KubernetesObject(object):
                             self.items[name] = item
         else:
             self.api_ok = False
+            self.health = "[ERR] : API {}.{} is invalid/inaccessible".format(self.api_name,
+                                                                             self.method_name)
+            self.log.error(self.health)
+
 
     @property
     def data(self):
@@ -243,55 +261,52 @@ class KubernetesObject(object):
     def watch(self):
         """ Start a thread which will use the kubernetes watch client against a resource """
         self.fetch()
-        self.log.info("[INF] Attaching resource watcher for k8s "
-                      "{}/{}".format(self.api_name, self.method_name))
         if self.api_ok:
+            self.log.info("[INF] : Attaching resource watcher for k8s "
+                          "{}.{}".format(self.api_name, self.method_name))
             self.watcher = self._watch()
 
     @threaded
     def _watch(self):
         """ worker thread that runs the kubernetes watch """
-        if self.raw_data:
-            res_ver = self.resource_version
 
-            w = watch.Watch()
-            func = getattr(self.api, self.method_name)
+        res_ver = self.resource_version
 
-            try:
-                # execute generator to continually watch resource for changes
-                for item in w.stream(func, resource_version=res_ver, watch=True):
-                    obj = item['object']
-                    try:
-                        name = obj.metadata.name
-                    except AttributeError:
-                        name = None
-                        self.log.warning("[WRN] {}.{} doesn't contain a metadata.name. "
-                                         "Unable to track changes".format(self.api_name,
-                                                                          self.method_name))
+        w = watch.Watch()
+        func = getattr(self.api, self.method_name)
 
-                    if item['type'] == 'ADDED':
-                        if self.filter(obj):
-                            if self.items and name:
-                                self.items[name] = obj
+        try:
+            # execute generator to continually watch resource for changes
+            for item in w.stream(func, resource_version=res_ver, watch=True):
+                obj = item['object']
+                try:
+                    name = obj.metadata.name
+                except AttributeError:
+                    name = None
+                    self.log.warning("[WRN] : {}.{} doesn't contain a metadata.name. "
+                                     "Unable to track changes".format(self.api_name,
+                                                                      self.method_name))
 
-                    elif item['type'] == 'DELETED':
-                        if self.filter(obj):
-                            if self.items and name:
-                                del self.items[name]
+                if item['type'] == 'ADDED':
+                    if self.filter(obj):
+                        if self.items and name:
+                            self.items[name] = obj
 
-            except AttributeError as e:
-                self.log.warning("[WRN] Unable to attach watcher - incompatible urllib3?")
-                self.log.warning("[WRN] {}".format(e))
-                self.api_ok = False
-        else:
+                elif item['type'] == 'DELETED':
+                    if self.filter(obj):
+                        if self.items and name:
+                            del self.items[name]
+
+        except AttributeError as e:
+            self.health = "[ERR] : Unable to attach watcher - incompatible urllib3? ({})".format(e)
+            self.log.error(self.health)
             self.api_ok = False
-            self.log.error("[ERR] Unable to call k8s API {}".format(self.api_name))
-        
+       
 
-class StorageClass(KubernetesObject):
+class StorageClass(KubernetesResource):
 
     def __init__(self, api_name='StorageV1Api', method_name='list_storage_class', log=None):
-        KubernetesObject.__init__(self, api_name, method_name, log)
+        KubernetesResource.__init__(self, api_name, method_name, log)
 
     def filter(self, item):
         """ only accept ceph based provisioners """
@@ -344,26 +359,28 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
             "desc": "Show the status of any kubernetes resources being tracked by mgr/rook",
             "perm": "r"
         },
-                {
+        {
             "cmd": "k8sresources detail",
             "desc": "Show the values of the mgr/rook tracked kubernetes resources",
             "perm": "r"
-        },
+        }
     ]
 
     def _k8sresources_summary(self):
-        fmt = KubernetesObject.fmt_string
-        out = fmt.format("Type", "Kubernetes API", "Last Full Fetch","API Ok", "Watch", "Items") + "\n"
-        if self.k8s_object.keys():
+        fmt = KubernetesResource.fmt_string
+        out = fmt.format("Type", "Kubernetes API", "OK?", "Last Full Fetch", "API Ok", "Watch", "Items") + "\n"
+        if self.k8s_resource.keys():
             
-            for v in sorted(self.k8s_object.keys()):
-                obj = self.k8s_object[v]
+            for v in sorted(self.k8s_resource.keys()):
+                obj = self.k8s_resource[v]
+                healthy = "Yes" if obj.health == "OK" else "No"
                 s = obj.status
                 out+=fmt.format(obj.__class__.__name__, 
                                 "{}.{}".format(obj.api_name, obj.method_name),
-                                time.strftime("%H:%M:%S %Z", time.localtime(s['fetch'])),
-                                str(s["api_available"]),
-                                str(s['watch']),
+                                healthy,
+                                s['fetch'],
+                                s["api_available"],
+                                s['watch'],
                                 str(s['items'])) + "\n"
         else:
             out += "No kubernetes resources monitored"
@@ -371,9 +388,9 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
 
     def _k8sresources_detail(self):
         out = ""
-        if self.k8s_object.keys():
-            for t in sorted(self.k8s_object.keys()):
-                obj = self.k8s_object[t]
+        if self.k8s_resource.keys():
+            for t in sorted(self.k8s_resource.keys()):
+                obj = self.k8s_resource[t]
                 out+=str(obj) + "\n"
         else:
             out = "No kubernetes resources being monitored"
@@ -464,7 +481,7 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
         self._initialized = threading.Event()
         self._k8s = None
         self._rook_cluster = None
-        self.k8s_object = dict()
+        self.k8s_resource = dict()
 
         self._shutdown = threading.Event()
 
@@ -494,18 +511,17 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
         if 'ROOK_CLUSTER_NAME' in os.environ:
             return os.environ['ROOK_CLUSTER_NAME']
 
-    def get_k8s_object(self, object_type, mode='readable'):
-        """ Return specific k8s object data """
+    def get_k8s_resource(self, resource_type=None, mode='readable'):
+        """ Return specific k8s resource data """
 
-        if object_type in self.k8s_object:
+        if resource_type in self.k8s_resource:
             if mode == 'readable':
-                return self.k8s_object[object_type].data
+                return self.k8s_resource[resource_type].data
             else:
-                return self.k8s_object[object_type].raw_data
+                return self.k8s_resource[resource_type].raw_data
         else:
-            self.log.warning("[WRN] request ignored for non-existent k8s object - {}".format(object_type))
+            self.log.warning("[WRN] request ignored for non-existent k8s resource - {}".format(resource_type))
             return None
-
 
     def serve(self):
         # For deployed clusters, we should always be running inside
@@ -527,13 +543,8 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
 
         self._k8s = client.CoreV1Api()
 
-        self.k8s_object['storageclass'] = StorageClass(log=self.log)
-        if self.k8s_object['storageclass'].valid:
-            self.k8s_object['storageclass'].watch()
-        else:
-            self.log.warning("[WRN] Unable to use k8s API - "
-                           "{}/{}".format(self.k8s_object['storageclass'].api_name, 
-                                          self.k8s_object['storageclass'].method_name))
+        self.k8s_resource['storageclass'] = StorageClass(log=self.log)
+        self.k8s_resource['storageclass'].watch()
 
         try:
             # XXX mystery hack -- I need to do an API call from
